@@ -25,17 +25,10 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.StringReader;
 import java.io.UnsupportedEncodingException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
 
+import javax.xml.namespace.NamespaceContext;
 import javax.xml.namespace.QName;
 import javax.xml.transform.ErrorListener;
 import javax.xml.transform.OutputKeys;
@@ -65,6 +58,7 @@ import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.ValidationContext;
 import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.components.Validator;
+import org.apache.nifi.context.PropertyContext;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.processor.AbstractProcessor;
@@ -75,6 +69,7 @@ import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.io.InputStreamCallback;
 import org.apache.nifi.processor.io.OutputStreamCallback;
+import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.stream.io.BufferedInputStream;
 import org.apache.nifi.stream.io.BufferedOutputStream;
 import org.xml.sax.EntityResolver;
@@ -111,6 +106,7 @@ public class EvaluateXPath extends AbstractProcessor {
     public static final String RETURN_TYPE_AUTO = "auto-detect";
     public static final String RETURN_TYPE_NODESET = "nodeset";
     public static final String RETURN_TYPE_STRING = "string";
+    public static final String NAMESPACE_ATTRIBUTE_PREFIX = "xmlns.";
 
     public static final PropertyDescriptor DESTINATION = new PropertyDescriptor.Builder()
             .name("Destination")
@@ -180,24 +176,74 @@ public class EvaluateXPath extends AbstractProcessor {
         this.properties = Collections.unmodifiableList(properties);
     }
 
+    protected XPathEvaluator buildXPathEvaluator(final XPathFactory factory, final Map<PropertyDescriptor, String> properties, Map<String, XPathExpression> attributeToXPathMap, List<ValidationResult> validationResults) {
+        final XPathEvaluator xpathEvaluator = (XPathEvaluator) factory.newXPath();
+        final Map<String, String> prefixToNamespaceMap = new HashMap<>();
+        final Map<String, String> namespaceToPrefixMap = new HashMap<>();
+
+        for (final Map.Entry<PropertyDescriptor, String> entry : properties.entrySet()) {
+            if (!entry.getKey().isDynamic()) {
+                continue;
+            }
+            if (entry.getKey().getName().startsWith(NAMESPACE_ATTRIBUTE_PREFIX)) {
+                String prefix = entry.getKey().getName().substring(6);
+                prefixToNamespaceMap.put(prefix, entry.getValue());
+                namespaceToPrefixMap.put(entry.getValue(), prefix);
+            }
+        }
+
+        if (!prefixToNamespaceMap.isEmpty()) {
+            xpathEvaluator.setNamespaceContext(new NamespaceContext() {
+                @Override
+                public String getNamespaceURI(String prefix) {
+                    return prefixToNamespaceMap.get(prefix);
+                }
+
+                @Override
+                public String getPrefix(String namespaceURI) {
+                    return namespaceToPrefixMap.get(namespaceURI);
+                }
+
+                @Override
+                public Iterator getPrefixes(String namespaceURI) {
+                    return prefixToNamespaceMap.keySet().iterator();
+                }
+            });
+        }
+
+        for (final Map.Entry<PropertyDescriptor, String> entry : properties.entrySet()) {
+            if (!entry.getKey().isDynamic() || entry.getKey().getName().startsWith(NAMESPACE_ATTRIBUTE_PREFIX)) {
+                continue;
+            }
+            final XPathExpression xpathExpression;
+            try {
+                xpathExpression = xpathEvaluator.compile(entry.getValue());
+                attributeToXPathMap.put(entry.getKey().getName(), xpathExpression);
+            } catch (XPathExpressionException e) {
+                validationResults.add(new ValidationResult.Builder().input(entry.getValue()).subject(entry.getKey().getName()).valid(false).explanation(e.toString()).build());
+            }
+        }
+
+        return xpathEvaluator;
+    }
+
     @Override
     protected Collection<ValidationResult> customValidate(final ValidationContext context) {
         final List<ValidationResult> results = new ArrayList<>(super.customValidate(context));
 
+        final Map<String, XPathExpression> attributeToXPathMap = new HashMap<>();
+        try {
+            XPathFactory factory = XPathFactory.newInstance(NamespaceConstant.OBJECT_MODEL_SAXON);
+            buildXPathEvaluator(factory, context.getProperties(), attributeToXPathMap, results);
+        } catch (final Exception e) {
+            results.add(new ValidationResult.Builder().subject("XPaths").valid(false)
+                    .explanation("Unable to initialize XPath engine due to " + e.toString()).build());
+        }
+
         final String destination = context.getProperty(DESTINATION).getValue();
-        if (DESTINATION_CONTENT.equals(destination)) {
-            int xpathCount = 0;
-
-            for (final PropertyDescriptor desc : context.getProperties().keySet()) {
-                if (desc.isDynamic()) {
-                    xpathCount++;
-                }
-            }
-
-            if (xpathCount != 1) {
-                results.add(new ValidationResult.Builder().subject("XPaths").valid(false)
-                        .explanation("Exactly one XPath must be set if using destination of " + DESTINATION_CONTENT).build());
-            }
+        if (DESTINATION_CONTENT.equals(destination) && attributeToXPathMap.size() != 1) {
+            results.add(new ValidationResult.Builder().subject("XPaths").valid(false)
+                    .explanation("Exactly one XPath must be set if using destination of " + DESTINATION_CONTENT).build());
         }
 
         return results;
@@ -220,9 +266,15 @@ public class EvaluateXPath extends AbstractProcessor {
 
     @Override
     protected PropertyDescriptor getSupportedDynamicPropertyDescriptor(final String propertyDescriptorName) {
+        Validator validator;
+        if (propertyDescriptorName.startsWith(NAMESPACE_ATTRIBUTE_PREFIX)) {
+            validator = StandardValidators.URI_VALIDATOR;
+        } else {
+            validator = StandardValidators.NON_EMPTY_VALIDATOR;
+        }
         return new PropertyDescriptor.Builder()
                 .name(propertyDescriptorName).expressionLanguageSupported(false)
-                .addValidator(new XPathValidator()).required(false).dynamic(true).build();
+                .addValidator(validator).required(false).dynamic(true).build();
     }
 
     @Override
@@ -252,21 +304,11 @@ public class EvaluateXPath extends AbstractProcessor {
             });
         }
 
-        final XPathFactory factory = factoryRef.get();
-        final XPathEvaluator xpathEvaluator = (XPathEvaluator) factory.newXPath();
         final Map<String, XPathExpression> attributeToXPathMap = new HashMap<>();
-
-        for (final Map.Entry<PropertyDescriptor, String> entry : context.getProperties().entrySet()) {
-            if (!entry.getKey().isDynamic()) {
-                continue;
-            }
-            final XPathExpression xpathExpression;
-            try {
-                xpathExpression = xpathEvaluator.compile(entry.getValue());
-                attributeToXPathMap.put(entry.getKey().getName(), xpathExpression);
-            } catch (XPathExpressionException e) {
-                throw new ProcessException(e);  // should not happen because we've already validated the XPath (in XPathValidator)
-            }
+        final List<ValidationResult> validationResults = new ArrayList<>();
+        final XPathEvaluator xpathEvaluator = buildXPathEvaluator(factoryRef.get(), context.getProperties(), attributeToXPathMap, validationResults);
+        if (!validationResults.isEmpty()) {
+            throw new ProcessException(validationResults.get(0).toString());  // should not happen because we've already validated the XPaths (in customValidate)
         }
 
         final XPathExpression slashExpression;
@@ -458,29 +500,6 @@ public class EvaluateXPath extends AbstractProcessor {
         transformer.transform(sourceNode, new StreamResult(out));
         if (error.get() != null) {
             throw error.get();
-        }
-    }
-
-    private static class XPathValidator implements Validator {
-
-        @Override
-        public ValidationResult validate(final String subject, final String input, final ValidationContext validationContext) {
-            try {
-                XPathFactory factory = XPathFactory.newInstance(NamespaceConstant.OBJECT_MODEL_SAXON);
-                final XPathEvaluator evaluator = (XPathEvaluator) factory.newXPath();
-
-                String error = null;
-                try {
-                    evaluator.compile(input);
-                } catch (final Exception e) {
-                    error = e.toString();
-                }
-
-                return new ValidationResult.Builder().input(input).subject(subject).valid(error == null).explanation(error).build();
-            } catch (final Exception e) {
-                return new ValidationResult.Builder().input(input).subject(subject).valid(false)
-                        .explanation("Unable to initialize XPath engine due to " + e.toString()).build();
-            }
         }
     }
 }

@@ -53,6 +53,31 @@ public class TestEvaluateXPath {
     }
 
     @Test
+    public void testAttributeWithNamespace() throws IOException {
+        final TestRunner testRunner = TestRunners.newTestRunner(new EvaluateXPath());
+        testRunner.setProperty(EvaluateXPath.DESTINATION, EvaluateXPath.DESTINATION_ATTRIBUTE);
+        testRunner.setProperty(EvaluateXPath.NAMESPACE_ATTRIBUTE_PREFIX + "ns1", "http://namespace/1");
+        // Ensure the wildcard prefix works even when we're namespace aware:
+        testRunner.setProperty("xpath.result1", "/*:bundle/node/subNode/value/text()");
+        testRunner.setProperty("xpath.result2", "/ns1:bundle/node/subNode/value/text()");
+
+        testRunner.enqueue(XML_SNIPPET);
+        testRunner.run();
+
+        testRunner.assertAllFlowFilesTransferred(EvaluateXPath.REL_MATCH, 1);
+        final MockFlowFile out = testRunner.getFlowFilesForRelationship(EvaluateXPath.REL_MATCH).get(0);
+        out.assertAttributeEquals("xpath.result1", "Hello");
+        out.assertAttributeEquals("xpath.result2", "Hello");
+    }
+
+    @Test
+    public void testUndefinedNamespacePrefix() {
+        final TestRunner testRunner = TestRunners.newTestRunner(new EvaluateXPath());
+        testRunner.setProperty("xpath.result2", "/ns1:bundle/node/subNode/value/text()");
+        testRunner.assertNotValid();
+    }
+
+    @Test
     public void testCheckIfElementExists() throws XPathFactoryConfigurationException, IOException {
         final TestRunner testRunner = TestRunners.newTestRunner(new EvaluateXPath());
         testRunner.setProperty(EvaluateXPath.DESTINATION, EvaluateXPath.DESTINATION_ATTRIBUTE);
